@@ -132,6 +132,41 @@ Cloudflare Email Security assigns one of these dispositions to each scanned mess
 | `BULK` | Bulk/marketing email |
 | `NONE` | Benign, no threat detected |
 
+## Security Considerations
+
+### Content Patterns Are Not an Authorization Signal
+
+**Content patterns are not a security boundary.** They are a convenience filter for reducing false positives on known-safe content, but they carry a fundamental limitation:
+
+> An attacker who controls an email's content can craft a message that matches a configured pattern, including those that reference internal project names, sender headers, or body text. If that email is also classified as `MALICIOUS`, `SUSPICIOUS`, or `SPOOF`, this Worker will release and reclassify it as benign.
+
+This design is intentional — there is no Cloudflare API mechanism to whitelist messages based on content, and this Worker works around that gap. That said, you must understand and accept this trade-off before deploying.
+
+**Risk mitigation guidelines:**
+
+- Keep patterns as specific and unique as possible. Avoid patterns that common phrases or header values an external sender can guess or reproduce.
+- Use `TARGET_DISPOSITIONS` to limit remediation to the lowest-risk dispositions for your environment (e.g., `["SPAM","BULK"]` instead of including `MALICIOUS`).
+- Enable `DRY_RUN = "true"` and audit matched messages before enabling live remediation.
+- Combine with Cloudflare Email Security's sender-based allow policies (`allow_policies` API) for known-benign senders, so patterns do not need to be the sole control.
+- Monitor the summary log after each run. An unexpected spike in `matched` count may indicate a malicious email is exploiting a pattern.
+- Rotate or update patterns if you have reason to believe the pattern set has been exposed.
+
+### No HTTP Trigger Endpoint
+
+This Worker exposes only a `/health` endpoint. There is no `/trigger` endpoint. The scheduled handler is invoked exclusively by the Wrangler cron schedule configured in `wrangler.toml`. To test the Worker manually during development, use:
+
+```bash
+npx wrangler dev
+# Then in a separate terminal:
+curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"
+```
+
+Or for production debugging, use `wrangler tail` to stream live logs:
+
+```bash
+npx wrangler tail
+```
+
 ## Important Notes
 
 ### Move vs Release

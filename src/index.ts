@@ -8,6 +8,7 @@
  *  4. If a pattern matches (likely false positive):
  *     a. Moves the message back to Inbox (or releases from quarantine)
  *     b. Optionally submits a reclassification to train the ML model
+ *     c. Marks the message as processed in KV only after remediation succeeds
  *  5. Tracks processed message IDs in KV to avoid duplicate work
  *
  * All API endpoints are confirmed against the official Cloudflare API reference:
@@ -23,6 +24,9 @@
  *   - Var:   RECLASSIFY_FP            ("true" to also submit reclassification, default "false")
  *   - Var:   MAX_MESSAGES_PER_RUN     (string number: safety cap, default "100")
  *   - Var:   DRY_RUN                  ("true" to scan and log matches without executing any write API calls)
+ *
+ * NOTE: This Worker exposes only a /health endpoint. There is no /trigger HTTP endpoint.
+ *       Use `wrangler dev` + `/__scheduled` for local manual testing.
  */
 
 export interface Env {
@@ -72,11 +76,11 @@ interface ApiResponse<T> {
   messages?: Array<{ code: number; message: string }>;
   success?: boolean;
   result_info?: {
-    cursor?: string;
+    /** Current API pagination cursor field (replaces legacy `cursor` / `cursors.after`). */
+    next?: string;
     count?: number;
     per_page?: number;
     total_count?: number;
-    cursors?: { before?: string; after?: string };
   };
 }
 
@@ -146,7 +150,8 @@ export async function searchMessages(
   }
 
   const messages = data.result ?? data.results ?? [];
-  const nextCursor = data.result_info?.cursor ?? data.result_info?.cursors?.after;
+  // The current Email Security API returns the next-page cursor in result_info.next.
+  const nextCursor = data.result_info?.next;
   return { messages, cursor: nextCursor };
 }
 
@@ -212,10 +217,32 @@ export async function moveMessagesBulk(env: Env, ids: string[], destination: Mov
     return { moved: [], failed: ids };
   }
 
-  const data: ApiResponse<Array<{ id: string; status?: string }>> = await res.json();
+  // The bulk move API returns one result row per recipient action, not one per submitted ID.
+  // Each row has `success: boolean` and `message_id: string` (the investigate ID).
+  // Aggregate by message_id: a message is fully moved only when every row for it is successful.
+  const data: ApiResponse<Array<{ success: boolean; message_id?: string; status?: string }>> = await res.json();
   const results = data.result ?? [];
-  const moved = results.filter((r) => r.status !== "failed").map((r) => r.id);
-  const failed = results.filter((r) => r.status === "failed").map((r) => r.id);
+
+  const successById = new Map<string, boolean>();
+  for (const r of results) {
+    const id = r.message_id;
+    if (!id) continue;
+    // If any row for this ID has success=false, the message is failed.
+    if (successById.has(id)) {
+      if (!r.success) successById.set(id, false);
+    } else {
+      successById.set(id, r.success === true);
+    }
+  }
+
+  // Any submitted ID missing from the response is treated as failed (unknown outcome).
+  const moved: string[] = [];
+  const failed: string[] = [];
+  for (const id of ids) {
+    const ok = successById.get(id);
+    if (ok === true) moved.push(id);
+    else failed.push(id);
+  }
   return { moved, failed };
 }
 
@@ -345,9 +372,15 @@ export default {
     let totalScanned = 0, totalMatched = 0, totalMoved = 0, totalReleased = 0;
     let totalReclassified = 0, totalSkipped = 0, totalErrors = 0;
 
+    // toMove / toRelease hold matched message IDs pending remediation.
+    // We intentionally do NOT mark KV or queue reclassification until after
+    // remediation succeeds, so failures remain retryable on the next run.
     const toMove: string[] = [];
     const toRelease: string[] = [];
-    const toReclassify: string[] = [];
+
+    // Track non-matched messages that should be marked processed (deduped) but
+    // NOT reclassified.  Only populated outside dry-run.
+    const toMarkNoMatch: string[] = [];
 
     for (const disposition of dispositions) {
       let cursor: string | undefined;
@@ -378,38 +411,54 @@ export default {
           try {
             rawEml = await getRawEmail(env, msg.id);
           } catch (err) {
-            console.error(`[FP Remediator] Failed to fetch raw for ${msg.id}:`, err);
+            // Raw fetch failures are transient (429, 5xx, timeout). Do NOT mark the
+            // message processed — leave it retryable on the next run.
+            console.error(`[FP Remediator] Failed to fetch raw for ${msg.id} (will retry next run):`, err);
             totalErrors++;
-            await markProcessed(env.FP_REMEDIATOR_KV, msg.id);
             continue;
           }
 
           if (matchesPatterns(rawEml, patterns)) {
             totalMatched++;
-            console.log(`[FP Remediator] FP match: id=${msg.id}, disposition=${disposition}, sender=${msg.sender ?? msg.from_address ?? "unknown"}${dryRun ? " [DRY RUN — would remediate]" : ""}`);
+            console.log(`[FP Remediator] FP match: id=${msg.id}, disposition=${disposition}${dryRun ? " [DRY RUN — would remediate]" : ""}`);
 
             if (!dryRun) {
               if (msg.is_quarantined) toRelease.push(msg.id);
               else toMove.push(msg.id);
-              if (reclassifyFp) toReclassify.push(msg.id);
             }
-          }
-
-          if (!dryRun) {
-            await markProcessed(env.FP_REMEDIATOR_KV, msg.id);
+          } else {
+            // No pattern match: safe to dedup immediately (no remediation needed).
+            if (!dryRun) {
+              toMarkNoMatch.push(msg.id);
+            }
           }
         }
       }
     }
+
+    // Mark non-matched messages processed (no remediation, no reclassification).
+    for (const id of toMarkNoMatch) {
+      await markProcessed(env.FP_REMEDIATOR_KV, id);
+    }
+
+    // Track which IDs were successfully remediated so we can mark KV and reclassify.
+    const remediatedIds: string[] = [];
 
     // Release quarantined messages (batch)
     if (toRelease.length > 0) {
       try {
         const result = await releaseFromQuarantine(env, toRelease);
         totalReleased = result.delivered.length;
-        if (result.failed.length > 0) console.error(`[FP Remediator] Release failed for ${result.failed.length} messages`);
+        remediatedIds.push(...result.delivered);
+        if (result.failed.length > 0) {
+          console.error(`[FP Remediator] Release failed for ${result.failed.length} messages — will retry next run`);
+          totalErrors += result.failed.length;
+        }
         if (result.undelivered.length > 0) console.warn(`[FP Remediator] Undelivered: ${result.undelivered.length}`);
-      } catch (err) { console.error("[FP Remediator] Release batch failed:", err); totalErrors++; }
+      } catch (err) {
+        console.error("[FP Remediator] Release batch failed:", err);
+        totalErrors++;
+      }
     }
 
     // Move non-quarantined messages to Inbox (batch)
@@ -417,38 +466,49 @@ export default {
       try {
         const result = await moveMessagesBulk(env, toMove, "Inbox");
         totalMoved = result.moved.length;
-        if (result.failed.length > 0) console.error(`[FP Remediator] Move failed for ${result.failed.length} messages`);
-      } catch (err) { console.error("[FP Remediator] Move batch failed:", err); totalErrors++; }
+        remediatedIds.push(...result.moved);
+        if (result.failed.length > 0) {
+          console.error(`[FP Remediator] Move failed for ${result.failed.length} messages — will retry next run`);
+          totalErrors += result.failed.length;
+        }
+      } catch (err) {
+        console.error("[FP Remediator] Move batch failed:", err);
+        totalErrors++;
+      }
     }
 
-    // Reclassify (individual calls, async on API side)
-    if (toReclassify.length > 0) {
-      const promises = toReclassify.map((id) =>
-        reclassifyMessage(env, id, "NONE").then((ok) => { if (ok) totalReclassified++; }).catch((err) => { console.error(`[FP Remediator] Reclassify failed for ${id}:`, err); totalErrors++; }),
-      );
-      await Promise.all(promises);
+    // Mark successfully remediated messages as processed and, if configured,
+    // reclassify them.  Both actions are gated on confirmed remediation success.
+    for (const id of remediatedIds) {
+      await markProcessed(env.FP_REMEDIATOR_KV, id);
+    }
+
+    if (reclassifyFp && remediatedIds.length > 0) {
+      for (const id of remediatedIds) {
+        try {
+          const ok = await reclassifyMessage(env, id, "NONE");
+          if (ok) totalReclassified++;
+          else console.error(`[FP Remediator] Reclassify returned false for ${id}`);
+        } catch (err) {
+          console.error(`[FP Remediator] Reclassify failed for ${id}:`, err);
+          totalErrors++;
+        }
+      }
     }
 
     const elapsed = Date.now() - startTime;
     console.log(`[FP Remediator] Run complete in ${elapsed}ms: scanned=${totalScanned}, matched=${totalMatched}, moved=${totalMoved}, released=${totalReleased}, reclassified=${totalReclassified}, skipped=${totalSkipped}, errors=${totalErrors}${dryRun ? " [DRY RUN]" : ""}`);
   },
 
-  // Optional HTTP endpoint for manual trigger / health check
+  // Minimal HTTP endpoint — health check only.
+  // There is intentionally no /trigger endpoint; the scheduled handler is the
+  // sole entry point for remediation.  Use `wrangler dev` + /__scheduled for
+  // local manual testing.
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
       return new Response(JSON.stringify({ status: "ok", timestamp: new Date().toISOString(), dry_run: env.DRY_RUN === "true" }), { headers: { "Content-Type": "application/json" } });
-    }
-
-    if (url.pathname === "/trigger" && request.method === "POST") {
-      console.log("[FP Remediator] Manual trigger received");
-      try {
-        await this.scheduled({} as ScheduledController, env, {} as ExecutionContext);
-        return new Response(JSON.stringify({ status: "triggered", timestamp: new Date().toISOString(), dry_run: env.DRY_RUN === "true" }), { headers: { "Content-Type": "application/json" } });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: String(err) }), { status: 500, headers: { "Content-Type": "application/json" } });
-      }
     }
 
     return new Response("Not found", { status: 404 });

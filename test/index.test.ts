@@ -239,20 +239,20 @@ describe("searchMessages", () => {
     expect(result.messages[0].id).toBe("fallback-msg");
   });
 
-  it("returns the next cursor from result_info.cursor", async () => {
+  it("returns the next cursor from result_info.next", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(
-      okJson({ success: true, result: [], result_info: { cursor: "abc123" } }),
+      okJson({ success: true, result: [], result_info: { next: "abc123" } }),
     );
     const result = await searchMessages(makeEnv(), {});
     expect(result.cursor).toBe("abc123");
   });
 
-  it("returns the next cursor from result_info.cursors.after", async () => {
+  it("returns undefined cursor when result_info has no next field", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(
-      okJson({ success: true, result: [], result_info: { cursors: { after: "cursor-after" } } }),
+      okJson({ success: true, result: [], result_info: { count: 0, per_page: 20, total_count: 0 } }),
     );
     const result = await searchMessages(makeEnv(), {});
-    expect(result.cursor).toBe("cursor-after");
+    expect(result.cursor).toBeUndefined();
   });
 
   it("throws on HTTP error status", async () => {
@@ -379,18 +379,45 @@ describe("moveMessagesBulk", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.unstubAllGlobals(); });
 
-  it("separates moved and failed messages from the API response", async () => {
+  it("separates moved and failed messages using the success boolean and message_id field", async () => {
+    // The bulk move API returns one row per recipient action with success: boolean and message_id.
     vi.mocked(fetch).mockResolvedValueOnce(okJson({
       success: true,
       result: [
-        { id: "id-1", status: "success" },
-        { id: "id-2", status: "failed" },
-        { id: "id-3" },
+        { success: true,  message_id: "id-1" },
+        { success: false, message_id: "id-2" },
+        { success: true,  message_id: "id-3" },
       ],
     }));
     const result = await moveMessagesBulk(makeEnv(), ["id-1", "id-2", "id-3"], "Inbox");
     expect(result.moved).toEqual(expect.arrayContaining(["id-1", "id-3"]));
     expect(result.failed).toEqual(["id-2"]);
+  });
+
+  it("treats a submitted ID absent from the response as failed", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(okJson({
+      success: true,
+      result: [
+        { success: true, message_id: "id-1" },
+        // id-2 is missing from the response
+      ],
+    }));
+    const result = await moveMessagesBulk(makeEnv(), ["id-1", "id-2"], "Inbox");
+    expect(result.moved).toEqual(["id-1"]);
+    expect(result.failed).toEqual(["id-2"]);
+  });
+
+  it("marks a message as failed when any recipient row has success=false", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(okJson({
+      success: true,
+      result: [
+        { success: true,  message_id: "id-1" },
+        { success: false, message_id: "id-1" }, // second recipient failed
+      ],
+    }));
+    const result = await moveMessagesBulk(makeEnv(), ["id-1"], "Inbox");
+    expect(result.moved).toEqual([]);
+    expect(result.failed).toEqual(["id-1"]);
   });
 
   it("returns all IDs as failed on HTTP error", async () => {
@@ -525,27 +552,16 @@ describe("fetch handler", () => {
     expect(res.status).toBe(404);
   });
 
-  it("GET /trigger returns 404 (requires POST)", async () => {
+  it("GET /trigger returns 404 — the trigger endpoint does not exist", async () => {
     const req = new Request("https://worker.example.com/trigger", { method: "GET" });
     const res = await worker.fetch(req, makeEnv());
     expect(res.status).toBe(404);
   });
 
-  it("POST /trigger with no patterns configured returns triggered status", async () => {
-    // No CONTENT_PATTERNS → scheduled() exits early; should still return { status: "triggered" }
+  it("POST /trigger returns 404 — the trigger endpoint has been removed", async () => {
     const req = new Request("https://worker.example.com/trigger", { method: "POST" });
-    const testEnv = makeEnv({ CONTENT_PATTERNS: "[]" });
-    const res = await worker.fetch(req, testEnv);
-    expect(res.status).toBe(200);
-    const body = await res.json<{ status: string }>();
-    expect(body.status).toBe("triggered");
-  });
-
-  it("POST /trigger returns a valid ISO timestamp", async () => {
-    const req = new Request("https://worker.example.com/trigger", { method: "POST" });
-    const res = await worker.fetch(req, makeEnv({ CONTENT_PATTERNS: "[]" }));
-    const { timestamp } = await res.json<{ timestamp: string }>();
-    expect(new Date(timestamp).toISOString()).toBe(timestamp);
+    const res = await worker.fetch(req, makeEnv());
+    expect(res.status).toBe(404);
   });
 
   it("GET /health Content-Type is application/json", async () => {
@@ -594,12 +610,7 @@ describe("scheduled handler: full run", () => {
   beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
   afterEach(() => { vi.unstubAllGlobals(); });
 
-  /** Returns empty results for all dispositions except MALICIOUS. */
-  function emptyForDisposition(disposition: string): Response {
-    return okJson({ success: true, result: [], result_info: {} });
-  }
-
-  it("processes a non-quarantined matching message via move", async () => {
+  it("processes a non-quarantined matching message via move and marks KV after success", async () => {
     const message = makeMessage({ id: "full-run-001", is_quarantined: false });
     vi.mocked(fetch)
       // MALICIOUS search
@@ -610,19 +621,52 @@ describe("scheduled handler: full run", () => {
       .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
       // SPOOF search → empty
       .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
-      // bulk move
-      .mockResolvedValueOnce(okJson({ success: true, result: [{ id: "full-run-001", status: "success" }] }));
+      // bulk move — success: true, message_id field (current API schema)
+      .mockResolvedValueOnce(okJson({ success: true, result: [{ success: true, message_id: "full-run-001" }] }));
 
     const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', RECLASSIFY_FP: "false" });
     await expect(
       worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext),
     ).resolves.toBeUndefined();
 
-    // Message should now be marked as processed in KV
+    // KV must be marked only after confirmed move success
     expect(await isProcessed(env.FP_REMEDIATOR_KV, "full-run-001")).toBe(true);
   });
 
-  it("uses release endpoint for quarantined matching messages", async () => {
+  it("does NOT mark KV when the move API reports failure", async () => {
+    const message = makeMessage({ id: "move-fail-001", is_quarantined: false });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      // bulk move returns failure for this ID
+      .mockResolvedValueOnce(okJson({ success: true, result: [{ success: false, message_id: "move-fail-001" }] }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', RECLASSIFY_FP: "false" });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    // Message must remain retryable — KV must NOT be written
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "move-fail-001")).toBe(false);
+  });
+
+  it("does NOT mark KV when the move ID is absent from the response", async () => {
+    const message = makeMessage({ id: "move-absent-001", is_quarantined: false });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      // bulk move returns empty result — submitted ID is missing
+      .mockResolvedValueOnce(okJson({ success: true, result: [] }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', RECLASSIFY_FP: "false" });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "move-absent-001")).toBe(false);
+  });
+
+  it("uses release endpoint for quarantined matching messages and marks KV after delivery", async () => {
     const message = makeMessage({ id: "quar-001", is_quarantined: true });
     vi.mocked(fetch)
       .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
@@ -641,20 +685,42 @@ describe("scheduled handler: full run", () => {
     ).resolves.toBeUndefined();
 
     // Verify release was called (5th fetch call is the release endpoint)
-    const releaseCall = vi.mocked(fetch).mock.calls[4];
-    const url = releaseCall[0] as string;
-    expect(url).toContain("/release");
+    const releaseUrl = vi.mocked(fetch).mock.calls[4][0] as string;
+    expect(releaseUrl).toContain("/release");
+    // KV written after confirmed delivery
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "quar-001")).toBe(true);
   });
 
-  it("also calls reclassify when RECLASSIFY_FP is true", async () => {
+  it("does NOT mark KV when release fails (message stays retryable)", async () => {
+    const message = makeMessage({ id: "quar-fail-001", is_quarantined: true });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      // release returns failure
+      .mockResolvedValueOnce(okJson({
+        success: true,
+        result: [{ id: "quar-fail-001", delivered: [], failed: ["user@example.com"], undelivered: [] }],
+      }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', RECLASSIFY_FP: "false" });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "quar-fail-001")).toBe(false);
+  });
+
+  it("reclassifies only after confirmed move success (RECLASSIFY_FP=true)", async () => {
     const message = makeMessage({ id: "reclassify-001", is_quarantined: false });
     vi.mocked(fetch)
       .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
       .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
       .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
       .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
-      .mockResolvedValueOnce(okJson({ success: true, result: [{ id: "reclassify-001" }] })) // move
-      .mockResolvedValueOnce(okJson({ success: true })); // reclassify
+      // move succeeds
+      .mockResolvedValueOnce(okJson({ success: true, result: [{ success: true, message_id: "reclassify-001" }] }))
+      // reclassify
+      .mockResolvedValueOnce(okJson({ success: true }));
 
     const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', RECLASSIFY_FP: "true" });
     await expect(
@@ -665,6 +731,42 @@ describe("scheduled handler: full run", () => {
     expect(vi.mocked(fetch).mock.calls).toHaveLength(6);
     const reclassifyUrl = vi.mocked(fetch).mock.calls[5][0] as string;
     expect(reclassifyUrl).toContain("reclassify-001/reclassify");
+  });
+
+  it("does NOT reclassify when move fails", async () => {
+    // Use an ID that does not contain the word "reclassify" to avoid false URL matches.
+    const message = makeMessage({ id: "move-fail-no-reclass", is_quarantined: false });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      // move fails
+      .mockResolvedValueOnce(okJson({ success: true, result: [{ success: false, message_id: "move-fail-no-reclass" }] }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', RECLASSIFY_FP: "true" });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    // 5 calls only: 3 searches + 1 raw + 1 move — no reclassify call
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(5);
+    const urls = vi.mocked(fetch).mock.calls.map((c) => c[0] as string);
+    expect(urls.some((u) => u.endsWith("/reclassify"))).toBe(false);
+  });
+
+  it("does NOT mark KV for raw fetch failures (message stays retryable)", async () => {
+    const message = makeMessage({ id: "raw-fail-001", is_quarantined: false });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      // raw fetch fails transiently
+      .mockResolvedValueOnce(errorResponse(429, "Too Many Requests"))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]' });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    // Message must NOT be in KV — transient error must leave it retryable
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "raw-fail-001")).toBe(false);
   });
 
   it("skips already-processed messages (no raw fetch)", async () => {
@@ -705,7 +807,7 @@ describe("scheduled handler: full run", () => {
     expect(vi.mocked(fetch).mock.calls).toHaveLength(3);
   });
 
-  it("does not remediate a non-matching message but still marks it processed", async () => {
+  it("does not remediate a non-matching message but marks it processed immediately", async () => {
     const message = makeMessage({ id: "no-match-001", is_quarantined: false });
 
     vi.mocked(fetch)
@@ -722,7 +824,7 @@ describe("scheduled handler: full run", () => {
     // 4 calls: 3 searches + 1 raw; no move or release
     expect(vi.mocked(fetch).mock.calls).toHaveLength(4);
 
-    // Message is still marked processed to avoid reprocessing
+    // Non-matched message must be marked processed to avoid reprocessing
     expect(await isProcessed(env.FP_REMEDIATOR_KV, "no-match-001")).toBe(true);
   });
 
@@ -748,6 +850,35 @@ describe("scheduled handler: full run", () => {
 
     // 1 search + 2 raw = 3 total (not 4)
     expect(vi.mocked(fetch).mock.calls).toHaveLength(3);
+  });
+
+  it("paginates using result_info.next when the first page has a next cursor", async () => {
+    const message1 = makeMessage({ id: "page1-msg" });
+    const message2 = makeMessage({ id: "page2-msg" });
+    vi.mocked(fetch)
+      // MALICIOUS page 1 → has next cursor
+      .mockResolvedValueOnce(okJson({ success: true, result: [message1], result_info: { next: "cursor-abc" } }))
+      // raw for page1-msg — no match
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "no match" } }))
+      // MALICIOUS page 2 (cursor=cursor-abc) → no next cursor
+      .mockResolvedValueOnce(okJson({ success: true, result: [message2], result_info: {} }))
+      // raw for page2-msg — no match
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "no match" } }))
+      // SUSPICIOUS → empty
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      // SPOOF → empty
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]' });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    // Verify the second search request included the cursor
+    const call2Url = new URL(vi.mocked(fetch).mock.calls[2][0] as string);
+    expect(call2Url.searchParams.get("cursor")).toBe("cursor-abc");
+
+    // Both messages should be deduped
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "page1-msg")).toBe(true);
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "page2-msg")).toBe(true);
   });
 
   it("handles search API failure gracefully and continues to next disposition", async () => {
@@ -874,10 +1005,9 @@ describe("dry-run mode", () => {
     expect(body.dry_run).toBe(false);
   });
 
-  it("POST /trigger includes dry_run in the response", async () => {
+  it("POST /trigger returns 404 even in dry-run mode — the endpoint has been removed", async () => {
     const req = new Request("https://worker.example.com/trigger", { method: "POST" });
     const res = await worker.fetch(req, makeEnv({ CONTENT_PATTERNS: "[]", DRY_RUN: "true" }));
-    const body = await res.json<{ dry_run: boolean }>();
-    expect(body.dry_run).toBe(true);
+    expect(res.status).toBe(404);
   });
 });
