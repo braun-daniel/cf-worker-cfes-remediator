@@ -1,0 +1,42 @@
+name = "email-security-fp-remediator"
+main = "src/index.ts"
+compatibility_date = "2025-09-18"
+
+# ─── KV Namespace for dedup ──────────────────────────────────────────────────
+# Create with: npx wrangler kv namespace create FP_REMEDIATOR_KV
+# Then paste the returned ID below.
+[[kv_namespaces]]
+binding = "FP_REMEDIATOR_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+# ─── Scheduled trigger: every 5 minutes ───────────────────────────────────────
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ─── Worker variables (non-secret) ────────────────────────────────────────────
+[vars]
+CF_ACCOUNT_ID = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+
+# JSON array of regex patterns to match against raw EML content (headers + body).
+# If ANY pattern matches, the email is treated as a false positive and remediated.
+# Example: match emails containing a specific internal project codename or
+# a known benign sender header pattern that Cloudflare flags incorrectly.
+CONTENT_PATTERNS = '["YOUR_REGEX_PATTERN_HERE"]'
+
+# JSON array of dispositions to search for.
+# Options: MALICIOUS, SUSPICIOUS, SPOOF, SPAM, BULK, NONE
+TARGET_DISPOSITIONS = '["MALICIOUS","SUSPICIOUS","SPOOF"]'
+
+# How far back to search, in minutes. Should match or slightly exceed the cron interval.
+LOOKBACK_MINUTES = "5"
+
+# Whether to also submit a reclassification (false-positive report) to train the ML model.
+# "true" or "false"
+RECLASSIFY_FP = "true"
+
+# Safety cap: maximum number of messages to scan per run.
+MAX_MESSAGES_PER_RUN = "100"
+
+# ─── Secrets (set via CLI, NOT in this file) ──────────────────────────────────
+# Run: npx wrangler secret put CF_API_TOKEN
+# Paste your Cloudflare API token with "Cloud Email Security: Write" permission.
