@@ -76,6 +76,7 @@ Edit `wrangler.toml` and set:
 - `LOOKBACK_MINUTES`: Search window. Should match or slightly exceed the cron interval (default: `"5"`)
 - `RECLASSIFY_FP`: `"true"` to also submit false-positive reports to train the ML model
 - `MAX_MESSAGES_PER_RUN`: Safety cap (default: `"100"`)
+- `DRY_RUN`: `"true"` to scan and log matches without executing any write API calls (move, release, reclassify). KV dedup is also skipped so the same messages appear on every run. Use this to validate patterns before going live.
 
 ### Step 4: Set API Token Secret
 
@@ -115,6 +116,7 @@ Check `npx wrangler tail` for run logs.
 | `LOOKBACK_MINUTES` | var (string) | `"5"` | Search lookback window in minutes |
 | `RECLASSIFY_FP` | var (string) | `"true"` | Also submit false-positive reclassification |
 | `MAX_MESSAGES_PER_RUN` | var (string) | `"100"` | Max messages to scan per run |
+| `DRY_RUN` | var (string) | `"false"` | Scan and log matches without any write API calls or KV writes |
 | Cron schedule | wrangler.toml | `*/5 * * * *` | Every 5 minutes |
 
 ## Disposition Values
@@ -151,6 +153,18 @@ The regex patterns are tested against the **full raw EML**, which includes heade
 ### KV Dedup
 
 Processed message IDs are stored in KV with a 7-day TTL. This prevents reprocessing the same message across overlapping search windows and limits cost. The 1-minute overlap buffer in the lookback window ensures messages near the boundary are not missed.
+
+### Dry-Run Mode
+
+Set `DRY_RUN = "true"` to run the full scan pipeline without making any write API calls. In this mode:
+
+- `move`, `release`, and `reclassify` API calls are **skipped entirely**.
+- **KV dedup writes are skipped** — the same messages will appear on every run, so you can iterate on patterns without consuming your dedup budget.
+- Each matched message is logged with a `[DRY RUN — would remediate]` suffix.
+- The summary line is tagged `[DRY RUN]`.
+- The `/health` and `/trigger` HTTP responses include `"dry_run": true`.
+
+This is the recommended way to validate new `CONTENT_PATTERNS` before enabling live remediation.
 
 ### Reclassification
 

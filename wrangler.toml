@@ -37,6 +37,11 @@ RECLASSIFY_FP = "true"
 # Safety cap: maximum number of messages to scan per run.
 MAX_MESSAGES_PER_RUN = "100"
 
+# Dry-run mode: scan and log matches without executing any write API calls
+# (move, release, reclassify). KV dedup is also skipped so the same messages
+# will appear on the next run. Set to "true" to enable.
+DRY_RUN = "false"
+
 # ─── Secrets (set via CLI, NOT in this file) ──────────────────────────────────
 # Run: npx wrangler secret put CF_API_TOKEN
 # Paste your Cloudflare API token with "Cloud Email Security: Write" permission.

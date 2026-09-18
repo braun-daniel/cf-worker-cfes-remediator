@@ -22,6 +22,7 @@
  *   - Var:   LOOKBACK_MINUTES         (string number: how far back to search, default "5")
  *   - Var:   RECLASSIFY_FP            ("true" to also submit reclassification, default "false")
  *   - Var:   MAX_MESSAGES_PER_RUN     (string number: safety cap, default "100")
+ *   - Var:   DRY_RUN                  ("true" to scan and log matches without executing any write API calls)
  */
 
 export interface Env {
@@ -33,6 +34,7 @@ export interface Env {
   LOOKBACK_MINUTES: string;
   RECLASSIFY_FP: string;
   MAX_MESSAGES_PER_RUN: string;
+  DRY_RUN: string;
 }
 
 // ─── Types from the Cloudflare Email Security API ───────────────────────────
@@ -322,6 +324,11 @@ export default {
     const lookbackMinutes = parseInt(env.LOOKBACK_MINUTES ?? "5", 10);
     const reclassifyFp = env.RECLASSIFY_FP === "true";
     const maxMessages = parseInt(env.MAX_MESSAGES_PER_RUN ?? "100", 10);
+    const dryRun = env.DRY_RUN === "true";
+
+    if (dryRun) {
+      console.log("[FP Remediator] DRY RUN mode enabled — no write API calls will be made.");
+    }
 
     if (patterns.length === 0) {
       console.warn("[FP Remediator] No content patterns configured. Skipping run.");
@@ -379,14 +386,18 @@ export default {
 
           if (matchesPatterns(rawEml, patterns)) {
             totalMatched++;
-            console.log(`[FP Remediator] FP match: id=${msg.id}, disposition=${disposition}, sender=${msg.sender ?? msg.from_address ?? "unknown"}`);
+            console.log(`[FP Remediator] FP match: id=${msg.id}, disposition=${disposition}, sender=${msg.sender ?? msg.from_address ?? "unknown"}${dryRun ? " [DRY RUN — would remediate]" : ""}`);
 
-            if (msg.is_quarantined) toRelease.push(msg.id);
-            else toMove.push(msg.id);
-            if (reclassifyFp) toReclassify.push(msg.id);
+            if (!dryRun) {
+              if (msg.is_quarantined) toRelease.push(msg.id);
+              else toMove.push(msg.id);
+              if (reclassifyFp) toReclassify.push(msg.id);
+            }
           }
 
-          await markProcessed(env.FP_REMEDIATOR_KV, msg.id);
+          if (!dryRun) {
+            await markProcessed(env.FP_REMEDIATOR_KV, msg.id);
+          }
         }
       }
     }
@@ -419,7 +430,7 @@ export default {
     }
 
     const elapsed = Date.now() - startTime;
-    console.log(`[FP Remediator] Run complete in ${elapsed}ms: scanned=${totalScanned}, matched=${totalMatched}, moved=${totalMoved}, released=${totalReleased}, reclassified=${totalReclassified}, skipped=${totalSkipped}, errors=${totalErrors}`);
+    console.log(`[FP Remediator] Run complete in ${elapsed}ms: scanned=${totalScanned}, matched=${totalMatched}, moved=${totalMoved}, released=${totalReleased}, reclassified=${totalReclassified}, skipped=${totalSkipped}, errors=${totalErrors}${dryRun ? " [DRY RUN]" : ""}`);
   },
 
   // Optional HTTP endpoint for manual trigger / health check
@@ -427,14 +438,14 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ status: "ok", timestamp: new Date().toISOString(), dry_run: env.DRY_RUN === "true" }), { headers: { "Content-Type": "application/json" } });
     }
 
     if (url.pathname === "/trigger" && request.method === "POST") {
       console.log("[FP Remediator] Manual trigger received");
       try {
         await this.scheduled({} as ScheduledController, env, {} as ExecutionContext);
-        return new Response(JSON.stringify({ status: "triggered", timestamp: new Date().toISOString() }), { headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ status: "triggered", timestamp: new Date().toISOString(), dry_run: env.DRY_RUN === "true" }), { headers: { "Content-Type": "application/json" } });
       } catch (err) {
         return new Response(JSON.stringify({ error: String(err) }), { status: 500, headers: { "Content-Type": "application/json" } });
       }

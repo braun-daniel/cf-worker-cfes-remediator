@@ -38,6 +38,7 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
     LOOKBACK_MINUTES: "5",
     RECLASSIFY_FP: "false",
     MAX_MESSAGES_PER_RUN: "100",
+    DRY_RUN: "false",
     ...overrides,
   };
 }
@@ -762,5 +763,121 @@ describe("scheduled handler: full run", () => {
     await expect(
       worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ─── Dry-run mode ─────────────────────────────────────────────────────────────
+
+describe("dry-run mode", () => {
+  beforeEach(() => { vi.stubGlobal("fetch", vi.fn()); });
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it("does not call move, release, or reclassify for a matching message", async () => {
+    const message = makeMessage({ id: "dry-run-001", is_quarantined: false });
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }));
+
+    const testEnv = makeEnv({
+      CONTENT_PATTERNS: '["phoenix project"]',
+      RECLASSIFY_FP: "true",
+      DRY_RUN: "true",
+    });
+    await expect(
+      worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext),
+    ).resolves.toBeUndefined();
+
+    // 3 searches + 1 raw = 4 total; no move/release/reclassify calls
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(4);
+    const urls = vi.mocked(fetch).mock.calls.map((c) => c[0] as string);
+    expect(urls.some((u) => u.includes("/move"))).toBe(false);
+    expect(urls.some((u) => u.includes("/release"))).toBe(false);
+    expect(urls.some((u) => u.includes("/reclassify"))).toBe(false);
+  });
+
+  it("does not call release for a matching quarantined message", async () => {
+    const message = makeMessage({ id: "dry-run-quar", is_quarantined: true });
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }));
+
+    const testEnv = makeEnv({
+      CONTENT_PATTERNS: '["phoenix project"]',
+      DRY_RUN: "true",
+    });
+    await expect(
+      worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext),
+    ).resolves.toBeUndefined();
+
+    const urls = vi.mocked(fetch).mock.calls.map((c) => c[0] as string);
+    expect(urls.some((u) => u.includes("/release"))).toBe(false);
+  });
+
+  it("does not write to KV for processed messages in dry-run mode", async () => {
+    const message = makeMessage({ id: "dry-run-kv-001" });
+
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(okJson({ success: true, result: [message], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: { raw: "phoenix project" } }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }))
+      .mockResolvedValueOnce(okJson({ success: true, result: [], result_info: {} }));
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', DRY_RUN: "true" });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    // Message must NOT be in KV — dry-run must not mark it processed
+    expect(await isProcessed(env.FP_REMEDIATOR_KV, "dry-run-kv-001")).toBe(false);
+  });
+
+  it("re-scans the same message on a second run in dry-run mode", async () => {
+    const message = makeMessage({ id: "dry-run-rescan" });
+    const searchReply = () => okJson({ success: true, result: [message], result_info: {} });
+    const emptyReply = () => okJson({ success: true, result: [], result_info: {} });
+    const rawReply = () => okJson({ success: true, result: { raw: "no match" } });
+
+    // Two full runs: 3 searches + 1 raw each = 8 fetch calls total
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(searchReply())
+      .mockResolvedValueOnce(rawReply())
+      .mockResolvedValueOnce(emptyReply())
+      .mockResolvedValueOnce(emptyReply())
+      .mockResolvedValueOnce(searchReply())
+      .mockResolvedValueOnce(rawReply())
+      .mockResolvedValueOnce(emptyReply())
+      .mockResolvedValueOnce(emptyReply());
+
+    const testEnv = makeEnv({ CONTENT_PATTERNS: '["phoenix project"]', DRY_RUN: "true" });
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+    await worker.scheduled({} as ScheduledController, testEnv, {} as ExecutionContext);
+
+    // Both runs must have fetched /raw — message was not deduped
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(8);
+  });
+
+  it("GET /health includes dry_run: true when DRY_RUN is true", async () => {
+    const req = new Request("https://worker.example.com/health");
+    const res = await worker.fetch(req, makeEnv({ DRY_RUN: "true" }));
+    const body = await res.json<{ dry_run: boolean }>();
+    expect(body.dry_run).toBe(true);
+  });
+
+  it("GET /health includes dry_run: false when DRY_RUN is false", async () => {
+    const req = new Request("https://worker.example.com/health");
+    const res = await worker.fetch(req, makeEnv({ DRY_RUN: "false" }));
+    const body = await res.json<{ dry_run: boolean }>();
+    expect(body.dry_run).toBe(false);
+  });
+
+  it("POST /trigger includes dry_run in the response", async () => {
+    const req = new Request("https://worker.example.com/trigger", { method: "POST" });
+    const res = await worker.fetch(req, makeEnv({ CONTENT_PATTERNS: "[]", DRY_RUN: "true" }));
+    const body = await res.json<{ dry_run: boolean }>();
+    expect(body.dry_run).toBe(true);
   });
 });
