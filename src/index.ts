@@ -78,17 +78,17 @@ interface ApiResponse<T> {
   };
 }
 
-type Disposition = "MALICIOUS" | "SUSPICIOUS" | "SPOOF" | "SPAM" | "BULK" | "NONE";
+export type Disposition = "MALICIOUS" | "SUSPICIOUS" | "SPOOF" | "SPAM" | "BULK" | "NONE";
 
-type MoveDestination = "Inbox" | "JunkEmail" | "DeletedItems" | "RecoverableItemsDeletions" | "RecoverableItemsPurges";
+export type MoveDestination = "Inbox" | "JunkEmail" | "DeletedItems" | "RecoverableItemsDeletions" | "RecoverableItemsPurges";
 
-type ReclassifyDisposition = "NONE" | "BULK" | "MALICIOUS" | "SPAM" | "SPOOF" | "SUSPICIOUS";
+export type ReclassifyDisposition = "NONE" | "BULK" | "MALICIOUS" | "SPAM" | "SPOOF" | "SUSPICIOUS";
 
 // ─── API client ──────────────────────────────────────────────────────────────
 
 const API_BASE = "https://api.cloudflare.com/client/v4";
 
-function authHeaders(token: string): HeadersInit {
+export function authHeaders(token: string): HeadersInit {
   return {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
@@ -108,7 +108,7 @@ function authHeaders(token: string): HeadersInit {
  *   - detections_only:    boolean
  *   - message_action:     PREVIEW | QUARANTINE_RELEASED | MOVED
  */
-async function searchMessages(
+export async function searchMessages(
   env: Env,
   params: {
     disposition?: Disposition;
@@ -153,7 +153,7 @@ async function searchMessages(
  * GET /accounts/{account_id}/email-security/investigate/{investigate_id}/raw
  * Returns: { result: { raw: "<UTF-8 EML string>" } }
  */
-async function getRawEmail(env: Env, investigateId: string): Promise<string> {
+export async function getRawEmail(env: Env, investigateId: string): Promise<string> {
   const url = `${API_BASE}/accounts/${env.CF_ACCOUNT_ID}/email-security/investigate/${investigateId}/raw`;
   const res = await fetch(url, { headers: authHeaders(env.CF_API_TOKEN), method: "GET" });
 
@@ -174,7 +174,7 @@ async function getRawEmail(env: Env, investigateId: string): Promise<string> {
  * POST /accounts/{account_id}/email-security/investigate/{investigate_id}/move
  * Body: { destination: "Inbox" | "JunkEmail" | "DeletedItems" | ... }
  */
-async function moveMessage(env: Env, investigateId: string, destination: MoveDestination): Promise<boolean> {
+export async function moveMessage(env: Env, investigateId: string, destination: MoveDestination): Promise<boolean> {
   const url = `${API_BASE}/accounts/${env.CF_ACCOUNT_ID}/email-security/investigate/${investigateId}/move`;
   const res = await fetch(url, {
     headers: authHeaders(env.CF_API_TOKEN),
@@ -196,7 +196,7 @@ async function moveMessage(env: Env, investigateId: string, destination: MoveDes
  * POST /accounts/{account_id}/email-security/investigate/move
  * Body: { destination: "Inbox", ids: ["id1","id2",...] }
  */
-async function moveMessagesBulk(env: Env, ids: string[], destination: MoveDestination): Promise<{ moved: string[]; failed: string[] }> {
+export async function moveMessagesBulk(env: Env, ids: string[], destination: MoveDestination): Promise<{ moved: string[]; failed: string[] }> {
   const url = `${API_BASE}/accounts/${env.CF_ACCOUNT_ID}/email-security/investigate/move`;
   const res = await fetch(url, {
     headers: authHeaders(env.CF_API_TOKEN),
@@ -223,7 +223,7 @@ async function moveMessagesBulk(env: Env, ids: string[], destination: MoveDestin
  * Body: ["id1","id2",...]  (array of investigate IDs)
  * Returns per-message delivery status.
  */
-async function releaseFromQuarantine(env: Env, ids: string[]): Promise<{ delivered: string[]; failed: string[]; undelivered: string[] }> {
+export async function releaseFromQuarantine(env: Env, ids: string[]): Promise<{ delivered: string[]; failed: string[]; undelivered: string[] }> {
   const url = `${API_BASE}/accounts/${env.CF_ACCOUNT_ID}/email-security/investigate/release`;
   const res = await fetch(url, {
     headers: authHeaders(env.CF_API_TOKEN),
@@ -257,7 +257,7 @@ async function releaseFromQuarantine(env: Env, ids: string[]): Promise<{ deliver
  * Body: { expected_disposition: "NONE" | "BULK" | "MALICIOUS" | "SPAM" | "SPOOF" | "SUSPICIOUS" }
  * Processed asynchronously by Cloudflare's ML pipeline.
  */
-async function reclassifyMessage(env: Env, investigateId: string, expectedDisposition: ReclassifyDisposition): Promise<boolean> {
+export async function reclassifyMessage(env: Env, investigateId: string, expectedDisposition: ReclassifyDisposition): Promise<boolean> {
   const url = `${API_BASE}/accounts/${env.CF_ACCOUNT_ID}/email-security/investigate/${investigateId}/reclassify`;
   const res = await fetch(url, {
     headers: authHeaders(env.CF_API_TOKEN),
@@ -276,7 +276,7 @@ async function reclassifyMessage(env: Env, investigateId: string, expectedDispos
 
 // ─── Content matching ───────────────────────────────────────────────────────
 
-function parsePatterns(jsonStr: string): RegExp[] {
+export function parsePatterns(jsonStr: string): RegExp[] {
   try {
     const arr = JSON.parse(jsonStr) as string[];
     return arr.map((p) => new RegExp(p, "i"));
@@ -286,7 +286,7 @@ function parsePatterns(jsonStr: string): RegExp[] {
   }
 }
 
-function parseDispositions(jsonStr: string): Disposition[] {
+export function parseDispositions(jsonStr: string): Disposition[] {
   try {
     return JSON.parse(jsonStr) as Disposition[];
   } catch {
@@ -294,7 +294,7 @@ function parseDispositions(jsonStr: string): Disposition[] {
   }
 }
 
-function matchesPatterns(rawEml: string, patterns: RegExp[]): boolean {
+export function matchesPatterns(rawEml: string, patterns: RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(rawEml));
 }
 
@@ -302,11 +302,11 @@ function matchesPatterns(rawEml: string, patterns: RegExp[]): boolean {
 
 const KV_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
-async function isProcessed(kv: KVNamespace, id: string): Promise<boolean> {
+export async function isProcessed(kv: KVNamespace, id: string): Promise<boolean> {
   return (await kv.get(`processed:${id}`)) !== null;
 }
 
-async function markProcessed(kv: KVNamespace, id: string): Promise<void> {
+export async function markProcessed(kv: KVNamespace, id: string): Promise<void> {
   await kv.put(`processed:${id}`, new Date().toISOString(), { expirationTtl: KV_TTL_SECONDS });
 }
 

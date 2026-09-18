@@ -3,14 +3,19 @@
   "version": "1.0.0",
   "description": "Cloudflare Worker that auto-remediates false-positive email flags in Cloudflare Email Security based on content matching",
   "main": "src/index.ts",
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^4.20250918.0",
     "typescript": "^5.7.0",
+    "vitest": "^4.1.11",
     "wrangler": "^3.90.0"
   }
 }
